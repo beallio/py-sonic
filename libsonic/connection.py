@@ -20,32 +20,51 @@ from urllib import urlencode
 from .errors import *
 from pprint import pprint
 from cStringIO import StringIO
-import json , urllib2, httplib, socket, ssl
+import json , urllib2, httplib, logging, socket, ssl
 
-API_VERSION = '1.10.2'
+API_VERSION = '1.11.0'
 
+logger = logging.getLogger(__name__)
 
-class HTTPSConnectionV3(httplib.HTTPSConnection):
-    def __init__(self, *args, **kwargs):
-        httplib.HTTPSConnection.__init__(self, *args, **kwargs)
-        
+class HTTPSConnectionChain(httplib.HTTPSConnection):
+    _preferred_ssl_protos = (
+        ('TLSv1' , ssl.PROTOCOL_TLSv1) , 
+        ('SSLv3' , ssl.PROTOCOL_SSLv3) ,
+        ('SSLv23' , ssl.PROTOCOL_SSLv23) ,
+    )
+    _ssl_working_proto = None
+
     def connect(self):
         sock = socket.create_connection((self.host, self.port), self.timeout)
         if self._tunnel_host:
             self.sock = sock
             self._tunnel()
-        try:
-            self.sock = ssl.wrap_socket(sock, self.key_file, self.cert_file, ssl_version=ssl.PROTOCOL_SSLv3)
-        except ssl.SSLError, e:
-            print("Trying SSLv3.")
-            self.sock = ssl.wrap_socket(sock, self.key_file, self.cert_file, ssl_version=ssl.PROTOCOL_SSLv23)           
+        if self._ssl_working_proto is not None:
+            # If we have a working proto, let's use that straight away
+            logger.debug("Using known working proto: '%s'",
+                         self._ssl_working_proto)
+            self.sock = ssl.wrap_socket(sock, self.key_file, self.cert_file,
+                ssl_version=self._ssl_working_proto)
+            return
+        # Try connecting via the different SSL protos in preference order
+        for proto_name , proto in self._preferred_ssl_protos:
+            try:
+                self.sock = ssl.wrap_socket(sock, self.key_file, self.cert_file,
+                    ssl_version=proto)
+            except:
+                pass
+            else:
+                # Cache the working ssl version
+                HTTPSConnectionChain._ssl_working_proto = proto
+                break
 
-class HTTPSHandlerV3(urllib2.HTTPSHandler):
-    def https_open(self, req):
-        return self.do_open(HTTPSConnectionV3, req)
+
+class HTTPSHandlerChain(urllib2.HTTPSHandler):
+    def https_open(self , req):
+        return self.do_open(HTTPSConnectionChain, req)
+
 # install opener
-urllib2.install_opener(urllib2.build_opener(HTTPSHandlerV3()))
-
+urllib2.install_opener(urllib2.build_opener(HTTPSHandlerChain()))
 
 class PysHTTPRedirectHandler(urllib2.HTTPRedirectHandler):
     """
@@ -78,8 +97,25 @@ class Connection(object):
         This will create a connection to your subsonic server
 
         baseUrl:str         The base url for your server. Be sure to use 
-                            "https" for SSL connections
+                            "https" for SSL connections.  If you are using
+                            a port other than the default 4040, be sure to
+                            specify that with the port argument.  Do *not*
+                            append it here.  
+
                             ex: http://subsonic.example.com
+
+                            If you are running subsonic under a different 
+                            path, specify that with the "serverPath" arg,
+                            *not* here.  For example, if your subsonic
+                            lives at:
+
+                            https://mydomain.com:8080/path/to/subsonic/rest
+
+                            You would set the following:
+
+                            baseUrl = "https://mydomain.com"
+                            port = 8080
+                            serverPath = "/path/to/subsonic/rest"
         username:str        The username to use for the connection
         password:str        The password to use for the connection
         port:int            The port number to connect on.  The default for
@@ -738,16 +774,26 @@ class Connection(object):
             self._checkStatus(res)
         return res
 
-    def scrobble(self , sid , submission=True):
+    def scrobble(self , sid , submission=True , listenTime=None):
         """
         since: 1.5.0
 
         "Scrobbles" a given music file on last.fm.  Requires that the user
         has set this up.
 
+        Since 1.8.0 you may specify multiple id (and optionally time)
+        parameters to scrobble multiple files.
+
+        Since 1.11.0 this method will also update the play count and
+        last played timestamp for the song and album. It will also make
+        the song appear in the "Now playing" page in the web app, and
+        appear in the list of songs returned by getNowPlaying
+
         sid:str             The ID of the file to scrobble
         submission:bool     Whether this is a "submission" or a "now playing"
                             notification
+        listenTime:int      (Since 1.8.0) The time (unix timestamp) at 
+                            which the song was listened to.
 
         Returns a dict like the following:
 
@@ -758,7 +804,8 @@ class Connection(object):
         methodName = 'scrobble'
         viewName = '%s.view' % methodName
 
-        q = {'id': sid , 'submission': submission}
+        q = self._getQueryDict({'id': sid , 'submission': submission ,
+            'time': self._ts2milli(listenTime)})
 
         req = self._getRequest(viewName , q)
         res = self._doInfoReq(req)
@@ -1025,7 +1072,8 @@ class Connection(object):
         self._checkStatus(res)
         return res
 
-    def getAlbumList(self , ltype , size=10 , offset=0):
+    def getAlbumList(self , ltype , size=10 , offset=0 , fromYear=None , 
+            toYear=None , genre=None , musicFolderId=None):
         """
         since: 1.2.0
 
@@ -1041,6 +1089,14 @@ class Connection(object):
                         list albums in a given year range or genre.
         size:int        The number of albums to return. Max 500
         offset:int      The list offset. Use for paging. Max 5000
+        fromYear:int    If you specify the ltype as "byYear", you *must*
+                        specify fromYear
+        toYear:int      If you specify the ltype as "byYear", you *must*
+                        specify toYear
+        genre:str       The name of the genre e.g. "Rock".  You must specify
+                        genre if you set the ltype to "byGenre"
+        musicFolderId:str   Only return albums in the music folder with 
+                            the given ID. See getMusicFolders()
 
         Returns a dict like the following:
 
@@ -1062,7 +1118,9 @@ class Connection(object):
         methodName = 'getAlbumList'
         viewName = '%s.view' % methodName
 
-        q = {'type': ltype , 'size': size , 'offset': offset}
+        q = self._getQueryDict({'type': ltype , 'size': size , 
+            'offset': offset , 'fromYear': fromYear , 'toYear': toYear ,
+            'genre': genre , 'musicFolderId': musicFolderId})
 
         req = self._getRequest(viewName , q)
         res = self._doInfoReq(req)
@@ -1085,6 +1143,12 @@ class Connection(object):
                         list albums in a given year range or genre.
         size:int        The number of albums to return. Max 500
         offset:int      The list offset. Use for paging. Max 5000
+        fromYear:int    If you specify the ltype as "byYear", you *must*
+                        specify fromYear
+        toYear:int      If you specify the ltype as "byYear", you *must*
+                        specify toYear
+        genre:str       The name of the genre e.g. "Rock".  You must specify
+                        genre if you set the ltype to "byGenre"
 
         Returns a dict like the following:
            {u'albumList2': {u'album': [{u'artist': u'Massive Attack',
@@ -1110,7 +1174,9 @@ class Connection(object):
         methodName = 'getAlbumList2'
         viewName = '%s.view' % methodName
 
-        q = {'type': ltype , 'size': size , 'offset': offset}
+        q = self._getQueryDict({'type': ltype , 'size': size , 
+            'offset': offset , 'fromYear': fromYear , 'toYear': toYear ,
+            'genre': genre})
 
         req = self._getRequest(viewName , q)
         res = self._doInfoReq(req)
@@ -2128,6 +2194,92 @@ class Connection(object):
         self._checkStatus(res)
         return res
 
+    def getArtistInfo(self , aid , count=20 , includeNotPresent=False):
+        """
+        since: 1.11.0
+
+        Returns artist info with biography, image URLS and similar artists
+        using data from last.fm
+
+        aid:str                 The ID of the artist, album or song
+        count:int               The max number of similar artists to return
+        includeNotPresent:bool  Whether to return artists that are not 
+                                present in the media library
+        """
+        methodName = 'getArtistInfo'
+        viewName = '%s.view' % methodName
+
+        q = {'id': aid , 'count': count , 
+            'includeNotPresent': includeNotPresent}
+        
+        req = self._getRequest(viewName , q)
+        res = self._doInfoReq(req)
+        self._checkStatus(res)
+        return res
+
+    def getArtistInfo2(self , aid , count=20 , includeNotPresent=False):
+        """
+        since: 1.11.0
+
+        Similar to getArtistInfo(), but organizes music according to ID3 tags
+
+        aid:str                 The ID of the artist, album or song
+        count:int               The max number of similar artists to return
+        includeNotPresent:bool  Whether to return artists that are not 
+                                present in the media library
+        """
+        methodName = 'getArtistInfo2'
+        viewName = '%s.view' % methodName
+
+        q = {'id': aid , 'count': count , 
+            'includeNotPresent': includeNotPresent}
+        
+        req = self._getRequest(viewName , q)
+        res = self._doInfoReq(req)
+        self._checkStatus(res)
+        return res
+
+    def getSimilarSongs(self , iid , count=50):
+        """
+        since 1.11.0
+
+        Returns a random collection of songs from the given artist and 
+        similar artists, using data from last.fm. Typically used for 
+        artist radio features.
+
+        iid:str     The artist, album, or song ID
+        count:int   Max number of songs to return
+        """
+        methodName = 'getSimilarSongs'
+        viewName = '%s.view' % methodName
+
+        q = {'id': iid , 'count': count}
+        
+        req = self._getRequest(viewName , q)
+        res = self._doInfoReq(req)
+        self._checkStatus(res)
+        return res
+
+    def getSimilarSongs2(self , iid , count=50):
+        """
+        since 1.11.0
+
+        Similar to getSimilarSongs(), but organizes music according to 
+        ID3 tags
+
+        iid:str     The artist, album, or song ID
+        count:int   Max number of songs to return
+        """
+        methodName = 'getSimilarSongs2'
+        viewName = '%s.view' % methodName
+
+        q = {'id': iid , 'count': count}
+        
+        req = self._getRequest(viewName , q)
+        res = self._doInfoReq(req)
+        self._checkStatus(res)
+        return res
+
     def scanMediaFolders(self):
         """
         This is not an officially supported method of the API
@@ -2177,7 +2329,7 @@ class Connection(object):
     def _getOpener(self , username , passwd):
         creds = b64encode('%s:%s' % (username , passwd))
         opener = urllib2.build_opener(PysHTTPRedirectHandler , 
-           HTTPSHandlerV3)
+            HTTPSHandlerChain)
         opener.addheaders = [('Authorization' , 'Basic %s' % creds)]
         return opener
 
